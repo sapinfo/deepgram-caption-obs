@@ -1,6 +1,10 @@
 # Deepgram Captions for OBS
 
+[English](README.en.md) | **한국어**
+
 OBS Studio 플러그인으로 Deepgram Nova-3 API를 사용하여 실시간 음성 자막을 표시합니다.
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-donate-yellow)](https://buymeacoffee.com/inseokko)
 
 ## 주요 기능
 

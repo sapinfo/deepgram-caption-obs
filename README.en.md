@@ -1,6 +1,10 @@
 # Deepgram Captions for OBS
 
+**English** | [한국어](README.md)
+
 An OBS Studio plugin that provides real-time speech-to-text captions using the Deepgram Nova-3 API.
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-donate-yellow)](https://buymeacoffee.com/inseokko)
 
 ## Features
 
