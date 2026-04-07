@@ -32,7 +32,7 @@ git tag x.x.x && git push origin x.x.x
 - **Trigger**: Tag push only (`on.push.tags`). Main branch push does NOT trigger Actions.
 - **Builds**: macOS arm64 + x86_64 (cross-compile), Windows x64, Ubuntu x86_64
 - **Release**: Automatic draft release on valid semver tag (e.g., `0.1.0`)
-- **Codesigning**: macOS arm64 only (requires Apple Developer secrets)
+- **Codesigning**: Not configured. Builds are unsigned.
 
 ## Key Architecture Decisions
 - Single source file (`plugin-main.cpp`) - all plugin logic in one file
@@ -41,10 +41,21 @@ git tag x.x.x && git push origin x.x.x
 - Deepgram auth via HTTP Authorization header (not JSON body like Soniox)
 - Deepgram config via URL query parameters (not initial JSON message)
 - KeepAlive thread sends `{"type":"KeepAlive"}` every 5 seconds to prevent timeout
+- Button text toggle uses `obs_property_set_description()` in callback (not `get_properties` re-invocation). See `docs/OBS-Plugin-Button-Toggle-Fix.md`
 - x86_64 macOS CI: Intel Homebrew OpenSSL at `/usr/local/opt/openssl@3`
 - `CMakeLists.txt` guards `OPENSSL_ROOT_DIR` with `NOT DEFINED CACHE{}` to prevent preset override
+
+## Deepgram API Notes
+- WebSocket URL: `wss://api.deepgram.com/v1/listen` with query parameters
+- Auth: `Authorization: Token <key>` HTTP header
+- Response types: `Metadata`, `Results`, `UtteranceEnd`, `SpeechStarted`, `Error`
+- `is_final` = finalized transcript, `speech_final` = speaker finished utterance
+- Must send KeepAlive every 5s or connection drops after 10s silence
+- Send `{"type":"CloseStream"}` for graceful disconnect
+- No built-in translation (STT only, unlike Soniox)
 
 ## Important Conventions
 - Version in `buildspec.json` (single source of truth)
 - Commit messages: imperative mood, explain "why" not "what"
 - GitHub repo: `sapinfo/deepgram-caption-obs`
+- README style: language switch links at top, Buy Me A Coffee section at bottom (for-the-badge style)
