@@ -4,8 +4,6 @@
 
 An OBS Studio plugin that provides real-time speech-to-text captions using the Deepgram Nova-3 API.
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-donate-yellow)](https://buymeacoffee.com/inseokko)
-
 ## Features
 
 - **Real-time Speech-to-Text**: Powered by Deepgram Nova-3 model
@@ -74,6 +72,12 @@ Korean, English (US/UK), Japanese, Chinese (Simplified/Traditional), Spanish, Fr
 - **IXWebSocket** v11.4.5 (WebSocket client)
 - **nlohmann/json** v3.11.3 (JSON parsing)
 - **OpenSSL 3.x** (TLS)
+
+## Support
+
+If you find this project helpful, buy me a coffee!
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/inseokko)
 
 ## License
 

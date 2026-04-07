@@ -4,8 +4,6 @@
 
 OBS Studio 플러그인으로 Deepgram Nova-3 API를 사용하여 실시간 음성 자막을 표시합니다.
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-donate-yellow)](https://buymeacoffee.com/inseokko)
-
 ## 주요 기능
 
 - **실시간 음성-텍스트 변환**: Deepgram Nova-3 모델 사용
@@ -74,6 +72,12 @@ cp -R build_macos/RelWithDebInfo/deepgram-caption-obs.plugin \
 - **IXWebSocket** v11.4.5 (WebSocket 클라이언트)
 - **nlohmann/json** v3.11.3 (JSON 파싱)
 - **OpenSSL 3.x** (TLS)
+
+## 후원
+
+이 프로젝트가 도움이 되셨다면 커피 한 잔 사주세요!
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/inseokko)
 
 ## 라이선스
 
