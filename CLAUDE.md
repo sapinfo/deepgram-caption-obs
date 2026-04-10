@@ -44,6 +44,7 @@ git tag x.x.x && git push origin x.x.x
 - Button text toggle uses `obs_property_set_description()` in callback (not `get_properties` re-invocation). See `docs/OBS-Plugin-Button-Toggle-Fix.md`
 - x86_64 macOS CI: Intel Homebrew OpenSSL at `/usr/local/opt/openssl@3`
 - `CMakeLists.txt` guards `OPENSSL_ROOT_DIR` with `NOT DEFINED CACHE{}` to prevent preset override
+- Text style properties (font/color/outline/shadow/width/wrap) use `obs_properties_add_font` + platform-specific text source settings (`text_gdiplus` on Windows, `text_ft2_source_v2` on macOS/Linux) — same pattern as Soniox plugin
 
 ## Deepgram API Notes
 - WebSocket URL: `wss://api.deepgram.com/v1/listen` with query parameters
