@@ -64,6 +64,7 @@ struct deepgram_caption_data {
 	bool punctuate{true};
 	bool interim_results{true};
 	int endpointing_ms{300};
+	int utterance_end_ms{1000};
 
 	// Text style
 	uint32_t color1{0xFFFFFFFF}; // ABGR (OBS internal format)
@@ -331,7 +332,7 @@ static std::string build_deepgram_url(deepgram_caption_data *data)
 		url += "&interim_results=true";
 
 	// Enable utterance end detection for clearing captions
-	url += "&utterance_end_ms=1500";
+	url += "&utterance_end_ms=" + std::to_string(data->utterance_end_ms);
 	url += "&vad_events=true";
 
 	return url;
@@ -506,6 +507,7 @@ static void hotkey_toggle_caption(void *private_data, obs_hotkey_id, obs_hotkey_
 	data->punctuate = obs_data_get_bool(settings, "punctuate");
 	data->interim_results = obs_data_get_bool(settings, "interim_results");
 	data->endpointing_ms = (int)obs_data_get_int(settings, "endpointing_ms");
+	data->utterance_end_ms = (int)obs_data_get_int(settings, "utterance_end_ms");
 	obs_data_release(settings);
 
 	if (data->captioning)
@@ -586,6 +588,7 @@ static void deepgram_caption_update(void *private_data, obs_data_t *settings)
 	data->punctuate = obs_data_get_bool(settings, "punctuate");
 	data->interim_results = obs_data_get_bool(settings, "interim_results");
 	data->endpointing_ms = (int)obs_data_get_int(settings, "endpointing_ms");
+	data->utterance_end_ms = (int)obs_data_get_int(settings, "utterance_end_ms");
 
 	// Text style
 	data->color1 = (uint32_t)obs_data_get_int(settings, "color1");
@@ -639,6 +642,7 @@ static bool on_start_stop_clicked(obs_properties_t *, obs_property_t *property, 
 	data->punctuate = obs_data_get_bool(settings, "punctuate");
 	data->interim_results = obs_data_get_bool(settings, "interim_results");
 	data->endpointing_ms = (int)obs_data_get_int(settings, "endpointing_ms");
+	data->utterance_end_ms = (int)obs_data_get_int(settings, "utterance_end_ms");
 	obs_data_release(settings);
 
 	if (data->captioning) {
@@ -689,6 +693,12 @@ static obs_properties_t *deepgram_caption_get_properties(void *private_data)
 	obs_property_list_add_string(model_list, "Nova-3 Medical", "nova-3-medical");
 	obs_property_list_add_string(model_list, "Nova-2", "nova-2");
 	obs_property_list_add_string(model_list, "Nova-2 General", "nova-2-general");
+	obs_property_set_long_description(
+		model_list,
+		"Deepgram transcription model.\n"
+		"• Nova-3 (Latest): Best overall accuracy, recommended for most use cases.\n"
+		"• Nova-3 Medical: Tuned for medical terminology.\n"
+		"• Nova-2: Previous generation, use only for compatibility.");
 
 	// Language selection
 	obs_property_t *lang =
@@ -709,14 +719,57 @@ static obs_properties_t *deepgram_caption_get_properties(void *private_data)
 	obs_property_list_add_string(lang, "Russian", "ru");
 	obs_property_list_add_string(lang, "Hindi", "hi");
 	obs_property_list_add_string(lang, "Multilingual (Auto)", "multi");
+	obs_property_set_long_description(
+		lang,
+		"Target language for transcription.\n"
+		"Use 'Multilingual (Auto)' for mixed-language content (Nova-3 only).");
 
 	// Transcription options
-	obs_properties_add_bool(props, "smart_format", "Smart Format");
-	obs_properties_add_bool(props, "punctuate", "Punctuation");
-	obs_properties_add_bool(props, "interim_results", "Show Interim Results");
+	obs_property_t *p_smart = obs_properties_add_bool(props, "smart_format", "Smart Format");
+	obs_property_set_long_description(
+		p_smart,
+		"Applies formatting like capitalization, numerals, dates, times, and "
+		"currency to improve readability. Recommended: ON.");
+
+	obs_property_t *p_punct = obs_properties_add_bool(props, "punctuate", "Punctuation");
+	obs_property_set_long_description(
+		p_punct,
+		"Adds punctuation marks (periods, commas, question marks) to the transcript.\n"
+		"Recommended: ON.");
+
+	obs_property_t *p_interim =
+		obs_properties_add_bool(props, "interim_results", "Show Interim Results");
+	obs_property_set_long_description(
+		p_interim,
+		"Shows real-time partial transcripts as you speak, before segments are "
+		"finalized.\nRecommended: ON for live captioning (lower perceived latency).");
 
 	// Endpointing sensitivity
-	obs_properties_add_int_slider(props, "endpointing_ms", "Endpointing (ms)", 100, 1000, 50);
+	obs_property_t *p_endpoint = obs_properties_add_int_slider(
+		props, "endpointing_ms", "Endpointing (ms)", 100, 1000, 50);
+	obs_property_set_long_description(
+		p_endpoint,
+		"Silence duration (ms) before Deepgram finalizes a speech segment.\n"
+		"Lower = shorter caption segments, higher = longer accumulated text.\n"
+		"\n"
+		"Recommended:\n"
+		"• 100-200ms: Continuous speech (sermons, lectures) — prevents screen overflow\n"
+		"• 300ms: General conversation (default)\n"
+		"• 500-1000ms: Short Q&A, when you want fewer segment breaks");
+
+	// Utterance end (buffer clear gap)
+	obs_property_t *p_utter = obs_properties_add_int_slider(
+		props, "utterance_end_ms", "Utterance End (ms)", 1000, 5000, 100);
+	obs_property_set_long_description(
+		p_utter,
+		"Silence gap (ms) after the last finalized word that triggers an "
+		"UtteranceEnd event,\nwhich clears the caption buffer. Minimum 1000ms "
+		"(Deepgram spec).\n"
+		"\n"
+		"Recommended:\n"
+		"• 1000ms: Fast buffer clear for sermons/lectures (default)\n"
+		"• 1500-2000ms: General use, keeps utterance on screen longer\n"
+		"• 3000-5000ms: When you want long lines to persist");
 
 	// ─── Text Style ───
 
@@ -754,6 +807,7 @@ static void deepgram_caption_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "punctuate", true);
 	obs_data_set_default_bool(settings, "interim_results", true);
 	obs_data_set_default_int(settings, "endpointing_ms", 300);
+	obs_data_set_default_int(settings, "utterance_end_ms", 1000);
 
 	// Font defaults (obs_data_t object)
 	obs_data_t *font_obj = obs_data_create();

@@ -38,7 +38,7 @@
     },
     "name": "deepgram-caption-obs",
     "displayName": "Deepgram Captions for OBS",
-    "version": "0.1.0",
+    "version": "0.3.0",
     "author": "inseokko",
     "website": "https://github.com/sapinfo/deepgram-caption-obs",
     "email": "inseokko@example.com"
