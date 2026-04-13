@@ -40,6 +40,7 @@ git tag x.x.x && git push origin x.x.x
 - Audio: OBS float32 48kHz -> int16 16kHz downsampled -> WebSocket binary to Deepgram
 - Deepgram auth via HTTP Authorization header (not JSON body like Soniox)
 - Deepgram config via URL query parameters (not initial JSON message)
+- Test Connection: sends `CloseStream` + `stop()` immediately after successful Open to avoid leaving idle connections
 - KeepAlive thread sends `{"type":"KeepAlive"}` every 5 seconds to prevent timeout
 - Button text toggle uses `obs_property_set_description()` in callback (not `get_properties` re-invocation). See `docs/OBS-Plugin-Button-Toggle-Fix.md`
 - x86_64 macOS CI: Intel Homebrew OpenSSL at `/usr/local/opt/openssl@3`

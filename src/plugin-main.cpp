@@ -460,6 +460,11 @@ static void test_connection(deepgram_caption_data *data)
 			data->connected = true;
 			update_text_display(data, "Connected OK!");
 			obs_log(LOG_INFO, "Test connection: OK");
+
+			// Close immediately after successful test
+			std::string close_msg = "{\"type\":\"CloseStream\"}";
+			data->websocket->sendText(close_msg);
+			data->websocket->stop();
 			break;
 		}
 		case ix::WebSocketMessageType::Message: {
