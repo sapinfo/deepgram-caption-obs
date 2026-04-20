@@ -6,6 +6,7 @@
  */
 
 #include <obs-module.h>
+#include <media-io/audio-resampler.h>
 #include <plugin-support.h>
 
 #include <ixwebsocket/IXWebSocket.h>
@@ -18,6 +19,8 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <sstream>
+#include <cctype>
 
 using json = nlohmann::json;
 
@@ -66,6 +69,22 @@ struct deepgram_caption_data {
 	int endpointing_ms{300};
 	int utterance_end_ms{1000};
 
+	// Nova-3 features
+	std::string keyterms;      // newline-separated list
+	bool diarize{false};
+	bool profanity_filter{false};
+	std::string redact_mode;   // "off", "numbers", "pci", "ssn", "all"
+	bool numerals{false};
+	bool filler_words{false};
+	bool detect_entities{false};
+	bool mip_opt_out{false};
+
+	// Audio resampling (OBS project SR -> 16kHz mono s16le)
+	audio_resampler_t *resampler{nullptr};
+
+	// Diarization state (speaker label tracking across interim updates)
+	int last_speaker{-1};
+
 	// Text style
 	uint32_t color1{0xFFFFFFFF}; // ABGR (OBS internal format)
 	uint32_t color2{0xFFFFFFFF};
@@ -74,6 +93,33 @@ struct deepgram_caption_data {
 	int custom_width{0};
 	bool word_wrap{false};
 };
+
+// ─── URL encode helper (RFC 3986 unreserved chars only) ───
+static std::string url_encode(const std::string &value)
+{
+	std::string out;
+	out.reserve(value.size() * 3);
+	for (unsigned char c : value) {
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+			out += static_cast<char>(c);
+		} else {
+			char buf[4];
+			snprintf(buf, sizeof(buf), "%%%02X", c);
+			out += buf;
+		}
+	}
+	return out;
+}
+
+// ─── Trim whitespace (including \r for CRLF inputs) ───
+static void trim_inplace(std::string &s)
+{
+	while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n'))
+		s.erase(s.begin());
+	while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n'))
+		s.pop_back();
+}
 
 // ─── Update text display ───
 static void update_text_display(deepgram_caption_data *data, const char *text)
@@ -124,6 +170,8 @@ static void update_text_display(deepgram_caption_data *data, const char *text)
 }
 
 // ─── Audio capture callback ───
+// Uses OBS's audio_resampler to convert the project's actual SR/layout
+// to 16kHz mono int16 with proper anti-aliasing, instead of naive 3:1 decimation.
 static void audio_capture_callback(void *param, obs_source_t *, const struct audio_data *audio,
 				   bool muted)
 {
@@ -131,28 +179,20 @@ static void audio_capture_callback(void *param, obs_source_t *, const struct aud
 
 	if (!data->captioning || !data->connected || !data->websocket || muted)
 		return;
-	if (!audio->data[0] || audio->frames == 0)
+	if (!data->resampler || !audio->data[0] || audio->frames == 0)
 		return;
 
-	// OBS: float32, 48000Hz → Deepgram: pcm_s16le, 16000Hz (3:1 downsample)
-	const float *src = reinterpret_cast<const float *>(audio->data[0]);
-	uint32_t src_frames = audio->frames;
-	uint32_t dst_frames = src_frames / 3;
-	if (dst_frames == 0)
+	uint8_t *output[MAX_AV_PLANES] = {0};
+	uint32_t out_frames = 0;
+	uint64_t ts_offset = 0;
+	bool ok = audio_resampler_resample(data->resampler, output, &out_frames, &ts_offset,
+					   reinterpret_cast<const uint8_t *const *>(audio->data),
+					   audio->frames);
+	if (!ok || out_frames == 0 || !output[0])
 		return;
 
-	std::vector<int16_t> pcm16(dst_frames);
-	for (uint32_t i = 0; i < dst_frames; i++) {
-		float sample = src[i * 3];
-		if (sample > 1.0f)
-			sample = 1.0f;
-		if (sample < -1.0f)
-			sample = -1.0f;
-		pcm16[i] = static_cast<int16_t>(sample * 32767.0f);
-	}
-
-	data->websocket->sendBinary(
-		std::string(reinterpret_cast<const char *>(pcm16.data()), pcm16.size() * sizeof(int16_t)));
+	data->websocket->sendBinary(std::string(reinterpret_cast<const char *>(output[0]),
+						out_frames * sizeof(int16_t)));
 }
 
 // ─── Handle Deepgram response message ───
@@ -186,6 +226,7 @@ static void handle_deepgram_message(deepgram_caption_data *data, const std::stri
 
 			data->final_buffer.clear();
 			data->partial_text.clear();
+			data->last_speaker = -1;
 			update_text_display(data, "");
 			return;
 		}
@@ -215,6 +256,36 @@ static void handle_deepgram_message(deepgram_caption_data *data, const std::stri
 		std::string transcript = alternatives[0].value("transcript", "");
 		bool is_final = resp.value("is_final", false);
 		bool speech_final = resp.value("speech_final", false);
+
+		// Diarization: rebuild transcript with [S1]/[S2] labels when speaker changes
+		if (data->diarize) {
+			auto words = alternatives[0].value("words", json::array());
+			if (!words.empty()) {
+				std::string labeled;
+				int prev = data->last_speaker;
+				for (auto &w : words) {
+					int sp = w.value("speaker", 0);
+					std::string token = w.value("punctuated_word",
+								   w.value("word", std::string()));
+					if (token.empty())
+						continue;
+					if (sp != prev) {
+						if (!labeled.empty())
+							labeled += " ";
+						labeled += "[S" + std::to_string(sp + 1) + "] ";
+						prev = sp;
+					} else if (!labeled.empty()) {
+						labeled += " ";
+					}
+					labeled += token;
+				}
+				if (!labeled.empty()) {
+					transcript = labeled;
+					if (is_final)
+						data->last_speaker = prev;
+				}
+			}
+		}
 
 		std::lock_guard<std::mutex> lock(data->text_mutex);
 
@@ -308,6 +379,12 @@ static void stop_captioning(deepgram_caption_data *data)
 		data->websocket.reset();
 	}
 
+	if (data->resampler) {
+		audio_resampler_destroy(data->resampler);
+		data->resampler = nullptr;
+	}
+
+	data->last_speaker = -1;
 	data->stopping = false;
 	update_text_display(data, "Deepgram Captions Ready!");
 	obs_log(LOG_INFO, "Captioning stopped");
@@ -334,6 +411,41 @@ static std::string build_deepgram_url(deepgram_caption_data *data)
 	// Enable utterance end detection for clearing captions
 	url += "&utterance_end_ms=" + std::to_string(data->utterance_end_ms);
 	url += "&vad_events=true";
+
+	// Nova-3 / accuracy & formatting features
+	if (data->diarize)
+		url += "&diarize=true";
+	if (data->profanity_filter)
+		url += "&profanity_filter=true";
+	if (!data->redact_mode.empty() && data->redact_mode != "off") {
+		if (data->redact_mode == "all") {
+			url += "&redact=numbers&redact=pci&redact=ssn";
+		} else {
+			url += "&redact=" + data->redact_mode;
+		}
+	}
+	if (data->numerals)
+		url += "&numerals=true";
+	if (data->filler_words)
+		url += "&filler_words=true";
+	if (data->detect_entities)
+		url += "&detect_entities=true";
+	if (data->mip_opt_out)
+		url += "&mip_opt_out=true";
+
+	// Keyterm prompting (Nova-3): newline-separated list, each line -> &keyterm=...
+	if (!data->keyterms.empty()) {
+		std::istringstream iss(data->keyterms);
+		std::string line;
+		while (std::getline(iss, line)) {
+			trim_inplace(line);
+			if (!line.empty())
+				url += "&keyterm=" + url_encode(line);
+		}
+	}
+
+	// Tag requests for dashboard filtering
+	url += "&tag=obs-plugin-" + std::string(PLUGIN_VERSION);
 
 	return url;
 }
@@ -362,7 +474,40 @@ static void start_captioning(deepgram_caption_data *data)
 		data->final_buffer.clear();
 		data->partial_text.clear();
 		data->utterance_count = 0;
+		data->last_speaker = -1;
 	}
+
+	// 0. Create resampler matching OBS project audio -> 16kHz mono s16le
+	struct obs_audio_info oai = {};
+	if (!obs_get_audio_info(&oai)) {
+		oai.samples_per_sec = 48000;
+		oai.speakers = SPEAKERS_STEREO;
+	}
+
+	struct resample_info src_info = {};
+	src_info.samples_per_sec = oai.samples_per_sec;
+	src_info.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	src_info.speakers = oai.speakers;
+
+	struct resample_info dst_info = {};
+	dst_info.samples_per_sec = 16000;
+	dst_info.format = AUDIO_FORMAT_16BIT;
+	dst_info.speakers = SPEAKERS_MONO;
+
+	if (data->resampler) {
+		audio_resampler_destroy(data->resampler);
+		data->resampler = nullptr;
+	}
+	data->resampler = audio_resampler_create(&dst_info, &src_info);
+	if (!data->resampler) {
+		obs_log(LOG_ERROR, "Failed to create audio resampler (%u Hz -> 16 kHz)",
+			oai.samples_per_sec);
+		update_text_display(data, "Error: audio resampler init failed");
+		obs_source_release(audio_src);
+		return;
+	}
+	obs_log(LOG_INFO, "Audio resampler: %u Hz (%d ch) -> 16000 Hz mono",
+		oai.samples_per_sec, (int)oai.speakers);
 
 	// 1. Setup WebSocket
 	data->websocket = std::make_unique<ix::WebSocket>();
@@ -496,6 +641,9 @@ static void test_connection(deepgram_caption_data *data)
 	data->websocket->start();
 }
 
+// Forward declaration: centralized settings loader (definition below update()).
+static void load_settings_into_data(deepgram_caption_data *data, obs_data_t *settings);
+
 // ─── Hotkey: Toggle Start/Stop Caption ───
 static void hotkey_toggle_caption(void *private_data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
 {
@@ -504,15 +652,7 @@ static void hotkey_toggle_caption(void *private_data, obs_hotkey_id, obs_hotkey_
 	auto *data = static_cast<deepgram_caption_data *>(private_data);
 
 	obs_data_t *settings = obs_source_get_settings(data->source);
-	data->api_key = obs_data_get_string(settings, "api_key");
-	data->language = obs_data_get_string(settings, "language");
-	data->model = obs_data_get_string(settings, "model");
-	data->audio_source_name = obs_data_get_string(settings, "audio_source");
-	data->smart_format = obs_data_get_bool(settings, "smart_format");
-	data->punctuate = obs_data_get_bool(settings, "punctuate");
-	data->interim_results = obs_data_get_bool(settings, "interim_results");
-	data->endpointing_ms = (int)obs_data_get_int(settings, "endpointing_ms");
-	data->utterance_end_ms = (int)obs_data_get_int(settings, "utterance_end_ms");
+	load_settings_into_data(data, settings);
 	obs_data_release(settings);
 
 	if (data->captioning)
@@ -571,11 +711,9 @@ static void deepgram_caption_destroy(void *private_data)
 	delete data;
 }
 
-static void deepgram_caption_update(void *private_data, obs_data_t *settings)
+// Centralized settings -> data loader. Used by update(), button callbacks, and hotkey.
+static void load_settings_into_data(deepgram_caption_data *data, obs_data_t *settings)
 {
-	auto *data = static_cast<deepgram_caption_data *>(private_data);
-
-	// Font (obs_data_t object)
 	obs_data_t *font_obj = obs_data_get_obj(settings, "font");
 	if (font_obj) {
 		data->font_face = obs_data_get_string(font_obj, "face");
@@ -595,13 +733,28 @@ static void deepgram_caption_update(void *private_data, obs_data_t *settings)
 	data->endpointing_ms = (int)obs_data_get_int(settings, "endpointing_ms");
 	data->utterance_end_ms = (int)obs_data_get_int(settings, "utterance_end_ms");
 
-	// Text style
+	data->keyterms = obs_data_get_string(settings, "keyterms");
+	data->diarize = obs_data_get_bool(settings, "diarize");
+	data->redact_mode = obs_data_get_string(settings, "redact_mode");
+	data->profanity_filter = obs_data_get_bool(settings, "profanity_filter");
+	data->numerals = obs_data_get_bool(settings, "numerals");
+	data->filler_words = obs_data_get_bool(settings, "filler_words");
+	data->detect_entities = obs_data_get_bool(settings, "detect_entities");
+	data->mip_opt_out = obs_data_get_bool(settings, "mip_opt_out");
+
 	data->color1 = (uint32_t)obs_data_get_int(settings, "color1");
 	data->color2 = (uint32_t)obs_data_get_int(settings, "color2");
 	data->outline = obs_data_get_bool(settings, "outline");
 	data->drop_shadow = obs_data_get_bool(settings, "drop_shadow");
 	data->custom_width = (int)obs_data_get_int(settings, "custom_width");
 	data->word_wrap = obs_data_get_bool(settings, "word_wrap");
+}
+
+static void deepgram_caption_update(void *private_data, obs_data_t *settings)
+{
+	auto *data = static_cast<deepgram_caption_data *>(private_data);
+
+	load_settings_into_data(data, settings);
 
 	if (!data->captioning && !data->connected) {
 		if (!data->api_key.empty())
@@ -616,9 +769,7 @@ static bool on_test_clicked(obs_properties_t *, obs_property_t *, void *private_
 {
 	auto *data = static_cast<deepgram_caption_data *>(private_data);
 	obs_data_t *settings = obs_source_get_settings(data->source);
-	data->api_key = obs_data_get_string(settings, "api_key");
-	data->language = obs_data_get_string(settings, "language");
-	data->model = obs_data_get_string(settings, "model");
+	load_settings_into_data(data, settings);
 	obs_data_release(settings);
 
 	if (data->connected) {
@@ -639,15 +790,7 @@ static bool on_start_stop_clicked(obs_properties_t *, obs_property_t *property, 
 	auto *data = static_cast<deepgram_caption_data *>(private_data);
 
 	obs_data_t *settings = obs_source_get_settings(data->source);
-	data->api_key = obs_data_get_string(settings, "api_key");
-	data->language = obs_data_get_string(settings, "language");
-	data->model = obs_data_get_string(settings, "model");
-	data->audio_source_name = obs_data_get_string(settings, "audio_source");
-	data->smart_format = obs_data_get_bool(settings, "smart_format");
-	data->punctuate = obs_data_get_bool(settings, "punctuate");
-	data->interim_results = obs_data_get_bool(settings, "interim_results");
-	data->endpointing_ms = (int)obs_data_get_int(settings, "endpointing_ms");
-	data->utterance_end_ms = (int)obs_data_get_int(settings, "utterance_end_ms");
+	load_settings_into_data(data, settings);
 	obs_data_release(settings);
 
 	if (data->captioning) {
@@ -776,6 +919,71 @@ static obs_properties_t *deepgram_caption_get_properties(void *private_data)
 		"• 1500-2000ms: General use, keeps utterance on screen longer\n"
 		"• 3000-5000ms: When you want long lines to persist");
 
+	// ─── Nova-3 Accuracy & Formatting ───
+
+	obs_property_t *p_keyterms =
+		obs_properties_add_text(props, "keyterms", "Keyterms (one per line)", OBS_TEXT_MULTILINE);
+	obs_property_set_long_description(
+		p_keyterms,
+		"Nova-3 Keyterm Prompting: boost recognition accuracy for proper nouns, "
+		"product names, jargon, or rare phrases.\n"
+		"One keyterm per line. Multi-word phrases are supported (e.g., \"Deepgram Nova\").\n"
+		"\n"
+		"Limits:\n"
+		"• Up to 100 keyterms\n"
+		"• 500 tokens total across all keyterms\n"
+		"• Nova-3 only (ignored by Nova-2)\n"
+		"\n"
+		"Use for: speaker names, brand names, technical terms, city/place names.");
+
+	obs_property_t *p_diarize = obs_properties_add_bool(props, "diarize", "Speaker Diarization");
+	obs_property_set_long_description(
+		p_diarize,
+		"Identify different speakers and prefix captions with [S1], [S2], etc.\n"
+		"Useful for interviews, panels, and multi-speaker recordings.\n"
+		"Streaming mode returns speaker numbers only (no confidence).");
+
+	obs_property_t *p_redact = obs_properties_add_list(props, "redact_mode", "Redact Sensitive Info",
+							   OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p_redact, "Off", "off");
+	obs_property_list_add_string(p_redact, "Numbers", "numbers");
+	obs_property_list_add_string(p_redact, "PCI (credit cards)", "pci");
+	obs_property_list_add_string(p_redact, "SSN", "ssn");
+	obs_property_list_add_string(p_redact, "All (numbers + PCI + SSN)", "all");
+	obs_property_set_long_description(
+		p_redact,
+		"Replace sensitive information in the transcript with placeholders.\n"
+		"Recommended for live broadcasts that may expose callers' account info.");
+
+	obs_property_t *p_prof =
+		obs_properties_add_bool(props, "profanity_filter", "Profanity Filter");
+	obs_property_set_long_description(
+		p_prof, "Mask profanity with asterisks. Useful for broadcast compliance.");
+
+	obs_property_t *p_num = obs_properties_add_bool(props, "numerals", "Numerals");
+	obs_property_set_long_description(
+		p_num,
+		"Render spoken numbers as digits (e.g., \"twenty three\" -> \"23\"). "
+		"Independent of Smart Format.");
+
+	obs_property_t *p_filler = obs_properties_add_bool(props, "filler_words", "Keep Filler Words");
+	obs_property_set_long_description(
+		p_filler,
+		"Include disfluencies like \"um\", \"uh\" in the transcript. "
+		"Turn OFF (default) for cleaner captions.");
+
+	obs_property_t *p_ent =
+		obs_properties_add_bool(props, "detect_entities", "Detect Entities");
+	obs_property_set_long_description(
+		p_ent, "Identify named entities (people, places, organizations) in the transcript.");
+
+	obs_property_t *p_mip =
+		obs_properties_add_bool(props, "mip_opt_out", "Opt out of Model Improvement");
+	obs_property_set_long_description(
+		p_mip,
+		"Prevent Deepgram from using your audio for model training. "
+		"Enable for sensitive or private content.");
+
 	// ─── Text Style ───
 
 	// Font selection (system font dialog)
@@ -813,6 +1021,16 @@ static void deepgram_caption_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "interim_results", true);
 	obs_data_set_default_int(settings, "endpointing_ms", 300);
 	obs_data_set_default_int(settings, "utterance_end_ms", 1000);
+
+	// Nova-3 feature defaults
+	obs_data_set_default_string(settings, "keyterms", "");
+	obs_data_set_default_bool(settings, "diarize", false);
+	obs_data_set_default_string(settings, "redact_mode", "off");
+	obs_data_set_default_bool(settings, "profanity_filter", false);
+	obs_data_set_default_bool(settings, "numerals", false);
+	obs_data_set_default_bool(settings, "filler_words", false);
+	obs_data_set_default_bool(settings, "detect_entities", false);
+	obs_data_set_default_bool(settings, "mip_opt_out", false);
 
 	// Font defaults (obs_data_t object)
 	obs_data_t *font_obj = obs_data_create();
