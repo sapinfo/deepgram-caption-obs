@@ -606,10 +606,16 @@ static void test_connection(deepgram_caption_data *data)
 			update_text_display(data, "Connected OK!");
 			obs_log(LOG_INFO, "Test connection: OK");
 
-			// Close immediately after successful test
+			// Close immediately after successful test.
+			// stop() joins the WebSocket run thread. This callback
+			// runs on that thread, so calling stop() here triggers
+			// self-join -> system_error -> terminate -> SIGABRT.
+			// Delegate to a detached thread so the callback can
+			// return first and the run thread exits naturally.
 			std::string close_msg = "{\"type\":\"CloseStream\"}";
 			data->websocket->sendText(close_msg);
-			data->websocket->stop();
+			ix::WebSocket *ws = data->websocket.get();
+			std::thread([ws]() { ws->stop(); }).detach();
 			break;
 		}
 		case ix::WebSocketMessageType::Message: {
